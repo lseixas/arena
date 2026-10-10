@@ -33,7 +33,7 @@ use crate::{
     routes::UuidPath,
     routes::auth::{CurrentUser, CurrentUserWithSession, OptionalUser},
     state::AppState,
-    tournament_bracket::persist_bracket,
+    tournament_bracket::{persist_bracket_unresolved, resolve_byes},
 };
 
 /// Cap for the leaderboard import qualifier flow.
@@ -483,7 +483,7 @@ fn bracket_match_card(
     let is_live = m.status == MatchStatus::InProgress;
     let can_edit_slots = view.bracket_slots_editable
         && m.round == 1
-        && (m.status == MatchStatus::Scheduled || (m.status == MatchStatus::Completed && is_bye));
+        && m.status == MatchStatus::Scheduled;
     let open_game = view.games.last();
 
     let col = m.visual_column * 2 + 1;
@@ -649,7 +649,9 @@ fn bracket_section(
 
     static EMPTY_PARTICIPANTS: Vec<BracketParticipant> = Vec::new();
     static EMPTY_GAMES: Vec<MatchGame> = Vec::new();
-    let bracket_slots_editable = is_owner && games_by_match.values().all(std::vec::Vec::is_empty);
+    let bracket_slots_editable = is_owner
+        && t.status == TournamentStatus::Registration
+        && games_by_match.values().all(std::vec::Vec::is_empty);
 
     html! {
         h2 class="vh" { "Bracket" }
@@ -1169,7 +1171,10 @@ pub async fn show_tournament(
     let owner_can_register = is_owner && can_register(&t, true);
 
     // Leaderboards for the owner's import form
-    let leaderboards = if is_owner && registrations_editable(t.status) {
+    let leaderboards = if is_owner
+        && registrations_editable(t.status)
+        && t.registration_status != RegistrationStatus::Closed
+    {
         leaderboard::get_active_leaderboards(&state.db)
             .await
             .wrap_err("Failed to fetch leaderboards")?
@@ -1177,14 +1182,13 @@ pub async fn show_tournament(
         vec![]
     };
 
-    // Bracket data, only once a bracket exists (in_progress or completed).
-    let bracket_data = if matches!(
-        t.status,
-        TournamentStatus::InProgress | TournamentStatus::Completed
-    ) {
-        let matches = tournament::get_matches_for_tournament(&state.db, tournament_id)
-            .await
-            .wrap_err("Failed to fetch tournament matches")?;
+    // A bracket can exist during the pre-start setup phase.
+    let matches = tournament::get_matches_for_tournament(&state.db, tournament_id)
+        .await
+        .wrap_err("Failed to fetch tournament matches")?;
+    let bracket_data = if matches.is_empty() {
+        None
+    } else {
         let participants =
             tournament::get_participants_with_names_for_tournament(&state.db, tournament_id)
                 .await
@@ -1209,11 +1213,11 @@ pub async fn show_tournament(
         }
 
         Some((matches, participants_by_match, games_by_match))
-    } else {
-        None
     };
 
-    let can_edit_registrations = registrations_editable(t.status);
+    let bracket_is_prepared =
+        t.status == TournamentStatus::Registration && bracket_data.is_some();
+    let can_edit_registrations = registrations_editable(t.status) && bracket_data.is_none();
     let max_seed = registrations.len();
 
     // Stat band numbers, cheap from data already fetched.
@@ -1333,7 +1337,7 @@ pub async fn show_tournament(
                 }
             }
 
-            // Bracket (in_progress / completed only)
+            // Bracket setup preview, then the live/completed bracket.
             @if let Some((matches, participants_by_match, games_by_match)) = &bracket_data {
                 (bracket_section(
                     &t,
@@ -1415,9 +1419,18 @@ pub async fn show_tournament(
                                         button type="submit" class="btn sm solid" { "Open Registration" }
                                     }
                                 }
-                                @if t.status == TournamentStatus::Registration {
+                                @if t.status == TournamentStatus::Registration && !bracket_is_prepared {
+                                    form action={"/tournaments/"(t.tournament_id)"/prepare"} method="post" {
+                                        button type="submit" class="btn sm solid" { "Prepare Bracket" }
+                                    }
+                                }
+                                @if bracket_is_prepared {
                                     form action={"/tournaments/"(t.tournament_id)"/start"} method="post" {
                                         button type="submit" class="btn sm solid" { "Start Tournament" }
+                                    }
+                                    form action={"/tournaments/"(t.tournament_id)"/reset"} method="post" {
+                                        button type="submit" class="btn sm"
+                                            onclick="return confirm('Discard this bracket setup and reopen registration?');" { "Discard Bracket" }
                                     }
                                 }
                                 @if t.status == TournamentStatus::InProgress {
@@ -1618,6 +1631,21 @@ pub async fn update_settings(
     }
 
     let edit_url = format!("/tournaments/{tournament_id}/edit");
+
+    if tournament::count_matches_for_tournament(&mut *tx, tournament_id)
+        .await
+        .wrap_err("Failed to check prepared bracket")?
+        > 0
+    {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Discard the prepared bracket before changing tournament settings".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &format!("/tournaments/{tournament_id}"),
+        )
+        .await;
+    }
 
     let registration_count = tournament::count_registrations(&mut *tx, tournament_id)
         .await
@@ -1837,6 +1865,17 @@ pub async fn unregister_snake(
         .await;
     }
 
+    if tournament::count_matches_for_tournament(&mut *tx, tournament_id).await? > 0 {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Discard the prepared bracket before changing registrations".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    }
+
     let registration = tournament::get_registration_by_id(&mut *tx, form.registration_id)
         .await
         .wrap_err("Failed to fetch registration")?
@@ -1932,6 +1971,17 @@ pub async fn move_seed(
         .await;
     }
 
+    if tournament::count_matches_for_tournament(&mut *tx, tournament_id).await? > 0 {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Discard the prepared bracket before changing seeds".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    }
+
     // Single in-transaction fetch: move_registration_seed reports a missing
     // registration as `false` and we surface it as a flash error.
     let moved = tournament::move_registration_seed(
@@ -2001,11 +2051,11 @@ pub async fn set_bracket_slot(
             .with_status(StatusCode::FORBIDDEN);
     }
 
-    if t.status != TournamentStatus::InProgress {
+    if t.status != TournamentStatus::Registration {
         return flash_redirect(
             &state,
             session.session_id,
-            "Bracket slots can only be edited while the tournament is in progress".to_string(),
+            "Bracket placement can only be edited before the tournament starts".to_string(),
             session::FLASH_TYPE_ERROR,
             &detail_url,
         )
@@ -2104,13 +2154,11 @@ pub async fn set_bracket_slot(
         .await;
     };
 
-    let is_completed_bye =
-        m.status == MatchStatus::Completed && participants.len() == 1 && m.winner_id.is_some();
-    if m.status != MatchStatus::Scheduled && !is_completed_bye {
+    if m.status != MatchStatus::Scheduled {
         return flash_redirect(
             &state,
             session.session_id,
-            "Only scheduled matches and automatic byes can be edited".to_string(),
+            "Only scheduled bracket slots can be edited".to_string(),
             session::FLASH_TYPE_ERROR,
             &detail_url,
         )
@@ -2262,21 +2310,42 @@ pub async fn update_status(
     .await
 }
 
-/// The start flow against the locked tournament row: read the registrations
-/// in-transaction, validate, persist the bracket, and CAS the tournament into
-/// `in_progress` at round 1. Returns `Ok(Err(message))` for user-facing
-/// refusals (the caller flashes and drops the transaction to roll back).
+/// Build an unresolved bracket for owner review before the tournament starts.
+async fn prepare_tournament_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    t: &Tournament,
+) -> cja::Result<Result<usize, String>> {
+    let registrations = tournament::get_registrations_for_tournament(&mut **tx, t.tournament_id)
+        .await
+        .wrap_err("Failed to fetch registrations")?;
+
+    if let Err(message) = validate_start(t, registrations.len() as i64) {
+        return Ok(Err(message));
+    }
+
+    if tournament::count_matches_for_tournament(&mut **tx, t.tournament_id).await? > 0 {
+        return Ok(Err("Bracket is already prepared".to_string()));
+    }
+
+    persist_bracket_unresolved(tx, t.tournament_id, &registrations)
+        .await
+        .wrap_err("Failed to prepare bracket")?;
+    tournament::set_tournament_registration_status(
+        &mut **tx,
+        t.tournament_id,
+        RegistrationStatus::Closed,
+    )
+    .await
+    .wrap_err("Failed to close registration for bracket setup")?;
+
+    Ok(Ok(registrations.len()))
+}
+
+/// Start a previously prepared bracket.
 ///
 /// `t` must come from `get_tournament_for_update` on this transaction:
 /// register/unregister take the same row lock, so the registration set read
-/// here can't change between validation and the bracket write — that's what
-/// keeps the bracket consistent with its seeds.
-///
-/// The row lock also serializes concurrent starts (the loser re-reads
-/// `in_progress` and is refused by `validate_start`), but as a second line of
-/// defense a `(tournament_id, round, position)` unique violation from a
-/// bracket that already exists is surfaced as a friendly refusal instead of
-/// a 500.
+/// here can't change between validation and the transition.
 async fn start_tournament_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     t: &Tournament,
@@ -2289,15 +2358,16 @@ async fn start_tournament_in_tx(
         return Ok(Err(message));
     }
 
-    if let Err(err) = persist_bracket(tx, t.tournament_id, &registrations).await {
-        if crate::tournament_match::is_unique_violation(
-            &err,
-            "tournament_matches_tournament_id_round_position_key",
-        ) {
-            return Ok(Err("Tournament already started".to_string()));
-        }
-        return Err(err).wrap_err("Failed to generate bracket");
+    if tournament::count_matches_for_tournament(&mut **tx, t.tournament_id).await? == 0 {
+        return Ok(Err(
+            "Prepare and review the bracket before starting the tournament".to_string(),
+        ));
     }
+
+    // Only now do byes count as completed matches and feed the next round.
+    resolve_byes(tx, t.tournament_id)
+        .await
+        .wrap_err("Failed to resolve bracket byes")?;
 
     // CAS on the locked row's status (validate_start guarantees it's
     // `registration` — that's the only status that can transition to
@@ -2317,17 +2387,72 @@ async fn start_tournament_in_tx(
     Ok(Ok(registrations.len()))
 }
 
-/// POST /tournaments/{id}/start — generate the bracket and begin round 1
-/// (owner only, BS-022).
+/// POST /tournaments/{id}/prepare — build the editable pre-start bracket.
+pub async fn prepare_tournament(
+    State(state): State<AppState>,
+    CurrentUserWithSession { user, session }: CurrentUserWithSession,
+    Path(tournament_id): Path<Uuid>,
+) -> ServerResult<impl IntoResponse, StatusCode> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .wrap_err("Failed to begin bracket preparation transaction")?;
+
+    let t = tournament::get_tournament_for_update(&mut tx, tournament_id)
+        .await
+        .wrap_err("Failed to fetch tournament")?
+        .ok_or_else(|| "Tournament not found".to_string())
+        .with_status(StatusCode::NOT_FOUND)?;
+
+    if t.user_id != user.user_id {
+        if is_hidden_from(&mut *tx, &t, user.user_id).await? {
+            return Err("Tournament not found".to_string()).with_status(StatusCode::NOT_FOUND);
+        }
+        return Err("Only the tournament owner can prepare its bracket".to_string())
+            .with_status(StatusCode::FORBIDDEN);
+    }
+
+    let detail_url = format!("/tournaments/{tournament_id}");
+    match prepare_tournament_in_tx(&mut tx, &t).await? {
+        Err(message) => {
+            drop(tx);
+            flash_redirect(
+                &state,
+                session.session_id,
+                message,
+                session::FLASH_TYPE_ERROR,
+                &detail_url,
+            )
+            .await
+        }
+        Ok(snake_count) => {
+            tx.commit()
+                .await
+                .wrap_err("Failed to commit bracket preparation")?;
+            flash_redirect(
+                &state,
+                session.session_id,
+                format!(
+                    "Bracket prepared with {snake_count} snakes. Review every matchup, then start the tournament."
+                ),
+                session::FLASH_TYPE_SUCCESS,
+                &detail_url,
+            )
+            .await
+        }
+    }
+}
+
+/// POST /tournaments/{id}/start — resolve byes and begin a prepared bracket.
 pub async fn start_tournament(
     State(state): State<AppState>,
     CurrentUserWithSession { user, session }: CurrentUserWithSession,
     Path(tournament_id): Path<Uuid>,
 ) -> ServerResult<impl IntoResponse, StatusCode> {
     // One transaction for the whole handler, with the tournament row locked
-    // FIRST: owner/status checks, the registration read, bracket
-    // persistence, and the status/round writes all see the same state, and
-    // register/unregister serialize on the same lock.
+    // FIRST: owner/status checks and the status/round writes all see the same
+    // state, and registration mutations serialize on the same lock.
     let mut tx = state
         .db
         .begin()
@@ -2533,13 +2658,18 @@ pub async fn reset_tournament(
 
     let detail_url = format!("/tournaments/{tournament_id}");
 
+    let match_count = tournament::count_matches_for_tournament(&mut *tx, tournament_id)
+        .await
+        .wrap_err("Failed to count tournament matches")?;
+    let discarding_setup = t.status == TournamentStatus::Registration && match_count > 0;
+
     // Completed tournaments are intentionally not resettable: once a
     // champion is decided the result is final (cancel is the only way out).
-    if t.status != TournamentStatus::InProgress {
+    if t.status != TournamentStatus::InProgress && !discarding_setup {
         return flash_redirect(
             &state,
             session.session_id,
-            "Only an in-progress tournament can be reset".to_string(),
+            "There is no active or prepared bracket to reset".to_string(),
             session::FLASH_TYPE_ERROR,
             &detail_url,
         )
@@ -2552,11 +2682,20 @@ pub async fn reset_tournament(
     tournament::set_tournament_current_round(&mut *tx, tournament_id, 0)
         .await
         .wrap_err("Failed to reset current round")?;
-    tournament::set_tournament_status(
+    if t.status == TournamentStatus::InProgress {
+        tournament::set_tournament_status(
+            &mut *tx,
+            tournament_id,
+            TournamentStatus::Registration,
+            TournamentStatus::InProgress,
+        )
+        .await
+        .wrap_err("Failed to return tournament to registration")?;
+    }
+    tournament::set_tournament_registration_status(
         &mut *tx,
         tournament_id,
-        TournamentStatus::Registration,
-        TournamentStatus::InProgress,
+        RegistrationStatus::Open,
     )
     .await
     .wrap_err("Failed to reopen registration")?;
@@ -2567,9 +2706,13 @@ pub async fn reset_tournament(
     flash_redirect(
         &state,
         session.session_id,
-        "Tournament reset — the bracket was cleared and registration is open again. \
-         Any games still running will finish on their own but won't count."
-            .to_string(),
+        if discarding_setup {
+            "Bracket setup discarded — registration is open again.".to_string()
+        } else {
+            "Tournament reset — the bracket was cleared and registration is open again. \
+             Any games still running will finish on their own but won't count."
+                .to_string()
+        },
         session::FLASH_TYPE_SUCCESS,
         &detail_url,
     )
@@ -2728,6 +2871,7 @@ pub async fn import_leaderboard(
 mod tests {
     use super::*;
     use crate::models::tournament::TournamentRegistration;
+    use crate::tournament_bracket::persist_bracket;
     use sqlx::PgPool;
 
     fn test_tournament(
@@ -3407,6 +3551,90 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../migrations")]
+    async fn prepare_keeps_byes_unresolved_until_tournament_start(
+        pool: PgPool,
+    ) -> cja::Result<()> {
+        let owner = fixture_user(&pool, 12, "prepare-owner").await?;
+        let t = tournament::create_tournament(&pool, owner, create_params(3)).await?;
+        tournament::set_tournament_status(
+            &pool,
+            t.tournament_id,
+            TournamentStatus::Registration,
+            TournamentStatus::Created,
+        )
+        .await?;
+
+        let mut seeded_snakes = Vec::new();
+        for seed in 1..=3i32 {
+            let snake = fixture_snake(&pool, owner, &format!("prepared-snake-{seed}")).await?;
+            tournament::create_registration(&pool, t.tournament_id, snake, owner, seed).await?;
+            seeded_snakes.push(snake);
+        }
+
+        let mut tx = pool.begin().await?;
+        let locked = tournament::get_tournament_for_update(&mut tx, t.tournament_id)
+            .await?
+            .expect("tournament exists");
+        prepare_tournament_in_tx(&mut tx, &locked)
+            .await?
+            .expect("bracket preparation should succeed");
+        tx.commit().await?;
+
+        let prepared = tournament::get_tournament_by_id(&pool, t.tournament_id)
+            .await?
+            .expect("tournament exists");
+        assert_eq!(prepared.status, TournamentStatus::Registration);
+        assert_eq!(prepared.registration_status, RegistrationStatus::Closed);
+
+        let matches = tournament::get_matches_for_tournament(&pool, t.tournament_id).await?;
+        let bye = matches
+            .iter()
+            .find(|m| m.round == 1 && m.position == 0)
+            .expect("three-snake bracket has a bye");
+        assert_eq!(bye.status, MatchStatus::Scheduled);
+        assert_eq!(bye.winner_id, None);
+        let final_match = matches
+            .iter()
+            .find(|m| m.round == 2)
+            .expect("three-snake bracket has a final");
+        assert!(
+            tournament::get_participants_for_match(&pool, final_match.match_id)
+                .await?
+                .iter()
+                .all(|p| p.battlesnake_id.is_none())
+        );
+
+        let mut tx = pool.begin().await?;
+        let locked = tournament::get_tournament_for_update(&mut tx, t.tournament_id)
+            .await?
+            .expect("tournament exists");
+        start_tournament_in_tx(&mut tx, &locked)
+            .await?
+            .expect("prepared tournament should start");
+        tx.commit().await?;
+
+        let started = tournament::get_tournament_by_id(&pool, t.tournament_id)
+            .await?
+            .expect("tournament exists");
+        assert_eq!(started.status, TournamentStatus::InProgress);
+        let matches = tournament::get_matches_for_tournament(&pool, t.tournament_id).await?;
+        let bye = matches
+            .iter()
+            .find(|m| m.match_id == bye.match_id)
+            .expect("bye still exists");
+        assert_eq!(bye.status, MatchStatus::Completed);
+        assert_eq!(bye.winner_id, Some(seeded_snakes[0]));
+        assert!(
+            tournament::get_participants_for_match(&pool, final_match.match_id)
+                .await?
+                .iter()
+                .any(|p| p.battlesnake_id == Some(seeded_snakes[0]))
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
     async fn double_start_gets_a_friendly_refusal_not_a_raw_error(pool: PgPool) -> cja::Result<()> {
         let user_id = fixture_user(&pool, 11, "double-starter").await?;
         let t = tournament::create_tournament(&pool, user_id, create_params(2)).await?;
@@ -3422,7 +3650,29 @@ mod tests {
             tournament::create_registration(&pool, t.tournament_id, snake, user_id, seed).await?;
         }
 
-        // First start succeeds and commits.
+        // Start cannot skip the setup screen.
+        let mut tx = pool.begin().await?;
+        let locked = tournament::get_tournament_for_update(&mut tx, t.tournament_id)
+            .await?
+            .expect("tournament exists");
+        let message = start_tournament_in_tx(&mut tx, &locked)
+            .await?
+            .expect_err("unprepared bracket must not start");
+        assert!(message.contains("Prepare and review"));
+        drop(tx);
+
+        // Prepare first: this creates the editable bracket without starting.
+        let mut tx = pool.begin().await?;
+        let locked = tournament::get_tournament_for_update(&mut tx, t.tournament_id)
+            .await?
+            .expect("tournament exists");
+        let snake_count = prepare_tournament_in_tx(&mut tx, &locked)
+            .await?
+            .expect("bracket preparation should succeed");
+        assert_eq!(snake_count, 2);
+        tx.commit().await?;
+
+        // First start of the prepared bracket succeeds and commits.
         let mut tx = pool.begin().await?;
         let locked = tournament::get_tournament_for_update(&mut tx, t.tournament_id)
             .await?
@@ -3453,25 +3703,6 @@ mod tests {
             "unexpected refusal message: {message}"
         );
         drop(tx);
-
-        // Belt-and-suspenders: if a bracket already exists anyway (simulated
-        // by forcing the status back without clearing the matches), the
-        // unique violation surfaces as the friendly message, not a raw error.
-        tournament::set_tournament_status(
-            &pool,
-            t.tournament_id,
-            TournamentStatus::Registration,
-            TournamentStatus::InProgress,
-        )
-        .await?;
-        let mut tx = pool.begin().await?;
-        let locked = tournament::get_tournament_for_update(&mut tx, t.tournament_id)
-            .await?
-            .expect("tournament exists");
-        let message = start_tournament_in_tx(&mut tx, &locked)
-            .await?
-            .expect_err("starting over an existing bracket should be refused");
-        assert_eq!(message, "Tournament already started");
         Ok(())
     }
 

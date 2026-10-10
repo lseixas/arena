@@ -559,6 +559,26 @@ where
     Ok(())
 }
 
+pub async fn set_tournament_registration_status<'e, E>(
+    executor: E,
+    tournament_id: Uuid,
+    registration_status: RegistrationStatus,
+) -> cja::Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query!(
+        "UPDATE tournaments SET registration_status = $2 WHERE tournament_id = $1",
+        tournament_id,
+        registration_status.as_str(),
+    )
+    .execute(executor)
+    .await
+    .wrap_err("Failed to update tournament registration status")?;
+
+    Ok(())
+}
+
 /// CAS variant of [`set_tournament_status`] that reports whether the swap
 /// applied instead of erroring: returns `false` when the tournament is missing
 /// or its status is no longer `expected`. Use this when losing the race is
@@ -1187,10 +1207,13 @@ where
     Ok(tournament_match)
 }
 
-pub async fn get_matches_for_tournament(
-    pool: &PgPool,
+pub async fn get_matches_for_tournament<'e, E>(
+    executor: E,
     tournament_id: Uuid,
-) -> cja::Result<Vec<TournamentMatch>> {
+) -> cja::Result<Vec<TournamentMatch>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let matches = sqlx::query_as!(
         TournamentMatch,
         r#"
@@ -1212,11 +1235,33 @@ pub async fn get_matches_for_tournament(
         "#,
         tournament_id
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .wrap_err("Failed to fetch tournament matches")?;
 
     Ok(matches)
+}
+
+pub async fn count_matches_for_tournament<'e, E>(
+    executor: E,
+    tournament_id: Uuid,
+) -> cja::Result<i64>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) AS "count!"
+        FROM tournament_matches
+        WHERE tournament_id = $1
+        "#,
+        tournament_id
+    )
+    .fetch_one(executor)
+    .await
+    .wrap_err("Failed to count tournament matches")?;
+
+    Ok(count)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

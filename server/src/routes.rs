@@ -252,6 +252,10 @@ pub fn routes(app_state: AppState) -> axum::Router {
             axum::routing::post(tournament::update_status),
         )
         .route(
+            "/tournaments/{id}/prepare",
+            axum::routing::post(tournament::prepare_tournament),
+        )
+        .route(
             "/tournaments/{id}/start",
             axum::routing::post(tournament::start_tournament),
         )

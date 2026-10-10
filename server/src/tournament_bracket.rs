@@ -3,8 +3,8 @@
 //! `generate_bracket` is pure and fully testable: it produces a
 //! [`BracketPlan`] describing every match in every round, seeded so that
 //! high seeds meet low seeds first and the top seeds can only meet in late
-//! rounds. `persist_bracket` writes a plan to the database for a tournament,
-//! resolving byes immediately (top seeds advance without playing).
+//! rounds. A bracket can be persisted for owner review before the tournament
+//! starts; automatic byes are resolved only when the owner starts it.
 
 use std::collections::HashMap;
 
@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::models::tournament::{
     CreateMatchParticipant, CreateTournamentMatch, MatchStatus, ParticipantType,
-    TournamentRegistration, create_match, create_match_participant,
+    TournamentRegistration, create_match, create_match_participant, get_matches_for_tournament,
+    get_participants_for_match,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,12 +118,11 @@ pub fn generate_bracket(participant_count: usize) -> cja::Result<BracketPlan> {
     })
 }
 
-/// Persist a bracket plan for a tournament.
+/// Persist a bracket plan for owner review without resolving byes.
 ///
 /// Creates every match with `next_match_id` links and visual coordinates,
 /// round-1 participants from `registrations` (matched by seed), and empty
-/// winner-fed slots for later rounds. Round-1 byes are resolved immediately:
-/// the lone participant is marked the winner and advanced into round 2.
+/// winner-fed slots for later rounds.
 ///
 /// Slot assignment is deterministic:
 /// - Round 1: the first seed of the pair (the higher seed, e.g. 1 in 1v8)
@@ -130,15 +130,9 @@ pub fn generate_bracket(participant_count: usize) -> cja::Result<BracketPlan> {
 /// - Later rounds: the feeder match with the lower `position` feeds slot 1,
 ///   the higher `position` feeds slot 2.
 ///
-/// Note that non-round-1 matches may be fully populated immediately: when two
-/// round-1 byes feed the same round-2 match (e.g. 5 participants), that
-/// round-2 match ends up with both participants filled while its status stays
-/// `scheduled`. This is intentional — matches are started by the owner-
-/// triggered round-execution scan, not by an event fired when a match fills.
-///
 /// `registrations` must contain exactly the seeds `1..=len` (the caller
 /// renumbers seeds on unregister, so this holds for any started tournament).
-pub async fn persist_bracket(
+pub async fn persist_bracket_unresolved(
     tx: &mut Transaction<'_, Postgres>,
     tournament_id: Uuid,
     registrations: &[TournamentRegistration],
@@ -237,28 +231,65 @@ pub async fn persist_bracket(
         }
     }
 
-    // Resolve byes: the lone participant wins and advances immediately.
-    for planned in plan.matches.iter().filter(|m| m.is_bye()) {
-        let match_id = lookup_match_id(&match_ids, planned.round, planned.position)?;
-        let seed = planned.seed_slots.iter().flatten().next().ok_or_else(|| {
+    Ok(())
+}
+
+/// Resolve every round-1 bye in an already persisted bracket.
+///
+/// This is called when the owner starts the tournament, after the bracket
+/// setup screen is complete. The current participant rows are authoritative,
+/// so owner swaps made during setup determine who advances.
+pub async fn resolve_byes(
+    tx: &mut Transaction<'_, Postgres>,
+    tournament_id: Uuid,
+) -> cja::Result<()> {
+    let matches = get_matches_for_tournament(&mut **tx, tournament_id).await?;
+
+    for tournament_match in matches
+        .iter()
+        .filter(|m| m.round == 1 && m.status == MatchStatus::Scheduled)
+    {
+        let participants =
+            get_participants_for_match(&mut **tx, tournament_match.match_id).await?;
+        if participants.len() != 1 {
+            continue;
+        }
+
+        let winner_battlesnake_id = participants[0].battlesnake_id.ok_or_else(|| {
             color_eyre::eyre::eyre!(
-                "Bye match at round {} position {} has no seed",
-                planned.round,
-                planned.position
+                "Bye match {} has an empty participant",
+                tournament_match.match_id
             )
         })?;
-        let winner_battlesnake_id = snake_for_seed(*seed)?;
 
-        complete_match_with_winner(tx, match_id, winner_battlesnake_id).await?;
+        complete_match_with_winner(tx, tournament_match.match_id, winner_battlesnake_id).await?;
 
-        if let Some(next_pos) = planned.next_position {
-            let next_match_id = lookup_match_id(&match_ids, planned.round + 1, next_pos)?;
-            fill_participant_from_source(tx, next_match_id, match_id, winner_battlesnake_id)
-                .await?;
+        if let Some(next_match_id) = tournament_match.next_match_id {
+            fill_participant_from_source(
+                tx,
+                next_match_id,
+                tournament_match.match_id,
+                winner_battlesnake_id,
+            )
+            .await?;
         }
     }
 
     Ok(())
+}
+
+/// Persist a bracket and immediately resolve its byes.
+///
+/// Kept as the low-level one-step operation used by existing bracket tests.
+/// The web flow uses [`persist_bracket_unresolved`] during setup and calls
+/// [`resolve_byes`] only when the tournament is started.
+pub async fn persist_bracket(
+    tx: &mut Transaction<'_, Postgres>,
+    tournament_id: Uuid,
+    registrations: &[TournamentRegistration],
+) -> cja::Result<()> {
+    persist_bracket_unresolved(tx, tournament_id, registrations).await?;
+    resolve_byes(tx, tournament_id).await
 }
 
 /// Mark a match completed with the given winner.
