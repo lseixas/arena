@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            mp.match_participant_id,\n            mp.match_id,\n            mp.slot,\n            mp.battlesnake_id,\n            mp.source_match_id,\n            mp.participant_type as \"participant_type: ParticipantType\",\n            mp.seed_position,\n            mp.created_at\n        FROM match_participants mp\n        JOIN tournament_matches tm ON mp.match_id = tm.match_id\n        WHERE tm.tournament_id = $1\n          AND mp.battlesnake_id = $2\n        LIMIT 1\n        ",
+  "query": "\n        SELECT\n            mp.match_participant_id,\n            mp.match_id,\n            mp.slot,\n            mp.battlesnake_id,\n            mp.source_match_id,\n            mp.participant_type as \"participant_type: ParticipantType\",\n            mp.seed_position,\n            mp.created_at\n        FROM match_participants mp\n        JOIN tournament_matches tm ON mp.match_id = tm.match_id\n        WHERE tm.tournament_id = $1\n          AND tm.round = 1\n          AND mp.battlesnake_id = $2\n        LIMIT 1\n        ",
   "describe": {
     "columns": [
       {
@@ -61,5 +61,5 @@
       false
     ]
   },
-  "hash": "52cd8f00e8b8f4bb4fb60dcf598ad343dd025fc7a25625c73c2a0fe3408ac93c"
+  "hash": "3e28123a7b7a6154e2bf2f535d14bf2a2d24b46eb04ea85a6cfd048bee658ed9"
 }

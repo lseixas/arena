@@ -1666,8 +1666,12 @@ where
     Ok(())
 }
 
-/// Find a participant row holding `battlesnake_id` anywhere in this tournament.
-pub async fn find_participant_holding_snake<'e, E>(
+/// Find the round-1 participant row holding `battlesnake_id`.
+///
+/// Every registered snake appears exactly once in round 1. A snake that
+/// received a bye may also appear in later rounds, so restricting this lookup
+/// to round 1 identifies its editable bracket origin.
+pub async fn find_round_one_participant_holding_snake<'e, E>(
     executor: E,
     tournament_id: Uuid,
     battlesnake_id: Uuid,
@@ -1690,6 +1694,7 @@ where
         FROM match_participants mp
         JOIN tournament_matches tm ON mp.match_id = tm.match_id
         WHERE tm.tournament_id = $1
+          AND tm.round = 1
           AND mp.battlesnake_id = $2
         LIMIT 1
         "#,
@@ -1703,24 +1708,97 @@ where
     Ok(participant)
 }
 
-/// Count match games for a match (used to refuse slot edits after play starts).
-pub async fn count_match_games<'e, E>(executor: E, match_id: Uuid) -> cja::Result<i64>
+/// Every participant-row id currently containing `battlesnake_id`.
+///
+/// Bye winners appear both in round 1 and in the next round. Returning all
+/// rows lets the bracket editor propagate a swap through those auto-advanced
+/// slots without touching feeder metadata.
+pub async fn get_bracket_participant_ids_for_snake<'e, E>(
+    executor: E,
+    tournament_id: Uuid,
+    battlesnake_id: Uuid,
+) -> cja::Result<Vec<Uuid>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let participant_ids = sqlx::query_scalar!(
+        r#"
+        SELECT mp.match_participant_id
+        FROM match_participants mp
+        JOIN tournament_matches tm ON mp.match_id = tm.match_id
+        WHERE tm.tournament_id = $1
+          AND mp.battlesnake_id = $2
+        "#,
+        tournament_id,
+        battlesnake_id,
+    )
+    .fetch_all(executor)
+    .await
+    .wrap_err("Failed to fetch snake's bracket participant rows")?;
+
+    Ok(participant_ids)
+}
+
+/// Count real games created anywhere in a tournament.
+///
+/// Slot swaps are only safe before this reaches one. Completed bye matches do
+/// not create `match_games`, so the owner can still choose who receives them.
+pub async fn count_match_games_for_tournament<'e, E>(
+    executor: E,
+    tournament_id: Uuid,
+) -> cja::Result<i64>
 where
     E: Executor<'e, Database = Postgres>,
 {
     let count = sqlx::query_scalar!(
         r#"
         SELECT COUNT(*) AS "count!"
-        FROM match_games
-        WHERE match_id = $1
+        FROM match_games mg
+        JOIN tournament_matches tm ON mg.match_id = tm.match_id
+        WHERE tm.tournament_id = $1
         "#,
-        match_id
+        tournament_id
     )
     .fetch_one(executor)
     .await
-    .wrap_err("Failed to count match games")?;
+    .wrap_err("Failed to count tournament match games")?;
 
     Ok(count)
+}
+
+/// Swap winner references produced by automatic byes.
+///
+/// This is only called while the tournament has no real `match_games`, so any
+/// existing winner is necessarily an automatically resolved bye.
+pub async fn swap_bye_winner_references<'e, E>(
+    executor: E,
+    tournament_id: Uuid,
+    first: Uuid,
+    second: Uuid,
+) -> cja::Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query!(
+        r#"
+        UPDATE tournament_matches
+        SET winner_id = CASE
+            WHEN winner_id = $2 THEN $3
+            WHEN winner_id = $3 THEN $2
+            ELSE winner_id
+        END
+        WHERE tournament_id = $1
+          AND winner_id IN ($2, $3)
+        "#,
+        tournament_id,
+        first,
+        second,
+    )
+    .execute(executor)
+    .await
+    .wrap_err("Failed to swap bye winner references")?;
+
+    Ok(())
 }
 
 /// All match games for every match in a tournament, in one query.

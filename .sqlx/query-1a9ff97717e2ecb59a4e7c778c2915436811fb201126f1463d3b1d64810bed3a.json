@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE tournament_matches\n        SET winner_id = CASE\n            WHEN winner_id = $2 THEN $3\n            WHEN winner_id = $3 THEN $2\n            ELSE winner_id\n        END\n        WHERE tournament_id = $1\n          AND winner_id IN ($2, $3)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1a9ff97717e2ecb59a4e7c778c2915436811fb201126f1463d3b1d64810bed3a"
+}

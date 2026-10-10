@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT mp.match_participant_id\n        FROM match_participants mp\n        JOIN tournament_matches tm ON mp.match_id = tm.match_id\n        WHERE tm.tournament_id = $1\n          AND mp.battlesnake_id = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "match_participant_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a078bbf59470225d41cde0d9e20bca2304552fe56da91318946882c91b5f521d"
+}

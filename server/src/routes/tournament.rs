@@ -314,6 +314,51 @@ async fn register_snake_in_tx(
     Ok(Ok(registration))
 }
 
+/// Swap two snakes everywhere they appear in a not-yet-played bracket.
+///
+/// Automatic bye winners already occupy their round-1 slot, the feeder slot
+/// in the next round, and `tournament_matches.winner_id`. Keeping those
+/// references together is what lets the owner reassign a bye safely.
+async fn swap_bracket_snakes_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tournament_id: Uuid,
+    first: Uuid,
+    second: Uuid,
+) -> cja::Result<()> {
+    let first_participant_ids =
+        tournament::get_bracket_participant_ids_for_snake(&mut **tx, tournament_id, first)
+            .await
+            .wrap_err("Failed to find current snake's bracket positions")?;
+    let second_participant_ids =
+        tournament::get_bracket_participant_ids_for_snake(&mut **tx, tournament_id, second)
+            .await
+            .wrap_err("Failed to find selected snake's bracket positions")?;
+
+    // Clear the first snake everywhere before moving either one. This avoids
+    // transient unique violations when both already occupy one later match.
+    for participant_id in &first_participant_ids {
+        tournament::set_match_participant_battlesnake(&mut **tx, *participant_id, None)
+            .await
+            .wrap_err("Failed to clear current snake's bracket position")?;
+    }
+    for participant_id in &second_participant_ids {
+        tournament::set_match_participant_battlesnake(&mut **tx, *participant_id, Some(first))
+            .await
+            .wrap_err("Failed to move current snake into selected positions")?;
+    }
+    for participant_id in &first_participant_ids {
+        tournament::set_match_participant_battlesnake(&mut **tx, *participant_id, Some(second))
+            .await
+            .wrap_err("Failed to move selected snake into target positions")?;
+    }
+
+    tournament::swap_bye_winner_references(&mut **tx, tournament_id, first, second)
+        .await
+        .wrap_err("Failed to propagate bye winner swap")?;
+
+    Ok(())
+}
+
 /// Start rules (BS-022): the tournament must be in `registration`, and enough
 /// snakes must be registered — at least `required_participants`, and never
 /// fewer than 2 (a bracket needs two sides even if the owner set a lower bar).
@@ -386,7 +431,7 @@ struct BracketMatchView<'a> {
     /// Registered snakes available for owner slot edits (round 1 only).
     registrations: &'a [tournament::RegistrationWithDetails],
     tournament_id: Uuid,
-    is_owner: bool,
+    bracket_slots_editable: bool,
 }
 
 /// One team row inside a match card: color chip, name, score cell.
@@ -436,10 +481,9 @@ fn bracket_match_card(
     // Byes only have their single seeded participant persisted.
     let is_bye = m.round == 1 && view.participants.len() == 1;
     let is_live = m.status == MatchStatus::InProgress;
-    let can_edit_slots = view.is_owner
+    let can_edit_slots = view.bracket_slots_editable
         && m.round == 1
-        && m.status == MatchStatus::Scheduled
-        && view.games.is_empty();
+        && (m.status == MatchStatus::Scheduled || (m.status == MatchStatus::Completed && is_bye));
     let open_game = view.games.last();
 
     let col = m.visual_column * 2 + 1;
@@ -450,17 +494,15 @@ fn bracket_match_card(
     } else {
         format!("R{} · M{}", m.round, m.position + 1)
     };
-    let status_label = match m.status {
-        MatchStatus::Scheduled => {
-            if is_bye {
-                "bye"
-            } else {
-                "scheduled"
-            }
+    let status_label = if is_bye {
+        "bye"
+    } else {
+        match m.status {
+            MatchStatus::Scheduled => "scheduled",
+            MatchStatus::InProgress => "live",
+            MatchStatus::Completed => "done",
+            MatchStatus::Canceled => "canceled",
         }
-        MatchStatus::InProgress => "live",
-        MatchStatus::Completed => "done",
-        MatchStatus::Canceled => "canceled",
     };
     // The game currently being played, for the theater strip.
     let live_game = if is_live { view.games.last() } else { None };
@@ -607,6 +649,7 @@ fn bracket_section(
 
     static EMPTY_PARTICIPANTS: Vec<BracketParticipant> = Vec::new();
     static EMPTY_GAMES: Vec<MatchGame> = Vec::new();
+    let bracket_slots_editable = is_owner && games_by_match.values().all(std::vec::Vec::is_empty);
 
     html! {
         h2 class="vh" { "Bracket" }
@@ -614,6 +657,9 @@ fn bracket_section(
             (matches.iter().filter(|m| m.status == MatchStatus::Completed).count())
             " of " (matches.len()) " matches played · "
             (total_rounds) @if total_rounds == 1 { " round" } @else { " rounds" }
+            @if bracket_slots_editable {
+                " · Edit round-1 slots to choose every matchup and who receives a bye"
+            }
         }
         div class="bracket-scroll" tabindex="0" role="region" aria-label="Tournament bracket" {
             div style={"min-width: "(min_width)"px;"} {
@@ -639,7 +685,7 @@ fn bracket_section(
                             games: games_by_match.get(&m.match_id).unwrap_or(&EMPTY_GAMES),
                             registrations,
                             tournament_id: t.tournament_id,
-                            is_owner,
+                            bracket_slots_editable,
                         };
                         (bracket_match_card(&view, t.match_style, total_rounds))
 
@@ -1922,9 +1968,11 @@ pub async fn move_seed(
     .await
 }
 
-/// POST /tournaments/{id}/bracket-slot — owner edits who occupies a round-1
-/// scheduled slot. If the chosen snake is already in another editable slot,
-/// the two snakes are swapped.
+/// POST /tournaments/{id}/bracket-slot — owner edits round-1 placement.
+///
+/// Selecting a snake swaps it with the current occupant across the whole
+/// bracket. That propagation lets an owner change who received an automatic
+/// bye. Editing closes as soon as the first real game is created.
 pub async fn set_bracket_slot(
     State(state): State<AppState>,
     CurrentUserWithSession { user, session }: CurrentUserWithSession,
@@ -1990,26 +2038,26 @@ pub async fn set_bracket_slot(
         .await;
     };
 
-    if m.round != 1 || m.status != MatchStatus::Scheduled {
+    if m.round != 1 {
         return flash_redirect(
             &state,
             session.session_id,
-            "Only scheduled round-1 slots can be edited".to_string(),
+            "Only round-1 bracket placement can be edited".to_string(),
             session::FLASH_TYPE_ERROR,
             &detail_url,
         )
         .await;
     }
 
-    if tournament::count_match_games(&mut *tx, m.match_id)
+    if tournament::count_match_games_for_tournament(&mut *tx, tournament_id)
         .await
-        .wrap_err("Failed to check match games")?
+        .wrap_err("Failed to check tournament games")?
         > 0
     {
         return flash_redirect(
             &state,
             session.session_id,
-            "Cannot edit a slot after its games have started".to_string(),
+            "Bracket placement is locked because a real game has already started".to_string(),
             session::FLASH_TYPE_ERROR,
             &detail_url,
         )
@@ -2045,7 +2093,31 @@ pub async fn set_bracket_slot(
         .await;
     };
 
-    if target.battlesnake_id == Some(form.battlesnake_id) {
+    let Some(previous_battlesnake_id) = target.battlesnake_id else {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Empty bracket slots cannot be edited directly".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    };
+
+    let is_completed_bye =
+        m.status == MatchStatus::Completed && participants.len() == 1 && m.winner_id.is_some();
+    if m.status != MatchStatus::Scheduled && !is_completed_bye {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Only scheduled matches and automatic byes can be edited".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    }
+
+    if previous_battlesnake_id == form.battlesnake_id {
         return flash_redirect(
             &state,
             session.session_id,
@@ -2056,78 +2128,32 @@ pub async fn set_bracket_slot(
         .await;
     }
 
-    let previous = target.battlesnake_id;
-    let other = tournament::find_participant_holding_snake(
+    let Some(_other) = tournament::find_round_one_participant_holding_snake(
         &mut *tx,
         tournament_id,
         form.battlesnake_id,
     )
     .await
-    .wrap_err("Failed to locate snake in bracket")?;
+    .wrap_err("Failed to locate snake's round-1 slot")?
+    else {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "That registered snake has no round-1 bracket slot".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    };
 
-    if let Some(other) = other {
-        let Some(other_match) = tournament::get_match_by_id(&mut *tx, other.match_id)
-            .await
-            .wrap_err("Failed to fetch other match")?
-        else {
-            return flash_redirect(
-                &state,
-                session.session_id,
-                "Could not resolve the snake's current match".to_string(),
-                session::FLASH_TYPE_ERROR,
-                &detail_url,
-            )
-            .await;
-        };
-
-        if other_match.round != 1
-            || other_match.status != MatchStatus::Scheduled
-            || tournament::count_match_games(&mut *tx, other_match.match_id)
-                .await
-                .wrap_err("Failed to check other match games")?
-                > 0
-        {
-            return flash_redirect(
-                &state,
-                session.session_id,
-                "That snake is already locked into another match".to_string(),
-                session::FLASH_TYPE_ERROR,
-                &detail_url,
-            )
-            .await;
-        }
-
-        // Clear first to avoid unique (match_id, battlesnake_id) collisions mid-swap.
-        tournament::set_match_participant_battlesnake(
-            &mut *tx,
-            other.match_participant_id,
-            None,
-        )
-        .await
-        .wrap_err("Failed to clear other slot")?;
-        tournament::set_match_participant_battlesnake(
-            &mut *tx,
-            target.match_participant_id,
-            Some(form.battlesnake_id),
-        )
-        .await
-        .wrap_err("Failed to set target slot")?;
-        tournament::set_match_participant_battlesnake(
-            &mut *tx,
-            other.match_participant_id,
-            previous,
-        )
-        .await
-        .wrap_err("Failed to finish snake swap")?;
-    } else {
-        tournament::set_match_participant_battlesnake(
-            &mut *tx,
-            target.match_participant_id,
-            Some(form.battlesnake_id),
-        )
-        .await
-        .wrap_err("Failed to set bracket slot")?;
-    }
+    swap_bracket_snakes_in_tx(
+        &mut tx,
+        tournament_id,
+        previous_battlesnake_id,
+        form.battlesnake_id,
+    )
+    .await
+    .wrap_err("Failed to swap bracket placement")?;
 
     tx.commit()
         .await
@@ -2136,7 +2162,7 @@ pub async fn set_bracket_slot(
     flash_redirect(
         &state,
         session.session_id,
-        "Bracket slot updated".to_string(),
+        "Bracket placement updated".to_string(),
         session::FLASH_TYPE_SUCCESS,
         &detail_url,
     )
@@ -3177,6 +3203,92 @@ mod tests {
 
         let total = tournament::count_registrations(&pool, t.tournament_id).await?;
         assert_eq!(total, 1);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn bracket_swap_reassigns_an_automatic_bye_and_its_advancement(
+        pool: PgPool,
+    ) -> cja::Result<()> {
+        let owner = fixture_user(&pool, 101, "bracket-owner").await?;
+        let snake_1 = fixture_snake(&pool, owner, "snake-1").await?;
+        let snake_2 = fixture_snake(&pool, owner, "snake-2").await?;
+        let snake_3 = fixture_snake(&pool, owner, "snake-3").await?;
+        let t = tournament::create_tournament(&pool, owner, create_params(3)).await?;
+
+        for (seed, snake) in [(1, snake_1), (2, snake_2), (3, snake_3)] {
+            tournament::create_registration(&pool, t.tournament_id, snake, owner, seed).await?;
+        }
+        let registrations =
+            tournament::get_registrations_for_tournament(&pool, t.tournament_id).await?;
+
+        let mut tx = pool.begin().await?;
+        persist_bracket(&mut tx, t.tournament_id, &registrations).await?;
+        tx.commit().await?;
+
+        let matches = tournament::get_matches_for_tournament(&pool, t.tournament_id).await?;
+        let bye = matches
+            .iter()
+            .find(|m| m.round == 1 && m.status == MatchStatus::Completed)
+            .expect("three-snake bracket has one completed bye");
+        let played_match = matches
+            .iter()
+            .find(|m| m.round == 1 && m.status == MatchStatus::Scheduled)
+            .expect("three-snake bracket has one scheduled match");
+        let final_match = matches
+            .iter()
+            .find(|m| m.round == 2)
+            .expect("three-snake bracket has a final");
+
+        assert_eq!(bye.winner_id, Some(snake_1));
+        assert!(
+            tournament::get_participants_for_match(&pool, final_match.match_id)
+                .await?
+                .iter()
+                .any(|p| p.battlesnake_id == Some(snake_1))
+        );
+
+        let mut tx = pool.begin().await?;
+        swap_bracket_snakes_in_tx(&mut tx, t.tournament_id, snake_1, snake_2).await?;
+        tx.commit().await?;
+
+        let matches = tournament::get_matches_for_tournament(&pool, t.tournament_id).await?;
+        let bye = matches
+            .iter()
+            .find(|m| m.match_id == bye.match_id)
+            .expect("bye still exists");
+        assert_eq!(bye.winner_id, Some(snake_2));
+
+        let bye_participants =
+            tournament::get_participants_for_match(&pool, bye.match_id).await?;
+        assert_eq!(bye_participants[0].battlesnake_id, Some(snake_2));
+
+        let played_participants =
+            tournament::get_participants_for_match(&pool, played_match.match_id).await?;
+        assert!(
+            played_participants
+                .iter()
+                .any(|p| p.battlesnake_id == Some(snake_1))
+        );
+        assert!(
+            !played_participants
+                .iter()
+                .any(|p| p.battlesnake_id == Some(snake_2))
+        );
+
+        let final_participants =
+            tournament::get_participants_for_match(&pool, final_match.match_id).await?;
+        assert!(
+            final_participants
+                .iter()
+                .any(|p| p.battlesnake_id == Some(snake_2))
+        );
+        assert!(
+            !final_participants
+                .iter()
+                .any(|p| p.battlesnake_id == Some(snake_1))
+        );
+
         Ok(())
     }
 
