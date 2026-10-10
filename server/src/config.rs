@@ -177,13 +177,16 @@ impl AppConfig {
             eyes: eyes_config_from_env()?,
 
             job: JobConfig {
-                poll_interval_ms: parse_env("ARENA_JOB_POLL_INTERVAL_MS", 60_000),
+                // 500ms so tournament "Run Round" starts games quickly.
+                // The previous 60s default stacked (round → match → runner)
+                // and could delay kickoff by minutes.
+                poll_interval_ms: parse_env("ARENA_JOB_POLL_INTERVAL_MS", 500),
                 lock_timeout_secs: parse_env(
                     "ARENA_JOB_LOCK_TIMEOUT_SECS",
                     DEFAULT_LOCK_TIMEOUT.as_secs(),
                 ),
                 max_retries: parse_env("ARENA_JOB_MAX_RETRIES", DEFAULT_MAX_RETRIES),
-                workers: parse_env::<usize>("ARENA_JOB_WORKERS", 1).max(1),
+                workers: parse_env::<usize>("ARENA_JOB_WORKERS", 2).max(1),
             },
             features: FeatureFlags {
                 server: feature_enabled("SERVER"),
@@ -220,10 +223,10 @@ impl AppConfig {
             rust_log: "info".to_string(),
             eyes: None,
             job: JobConfig {
-                poll_interval_ms: 60_000,
+                poll_interval_ms: 500,
                 lock_timeout_secs: 7200,
                 max_retries: 20,
-                workers: 1,
+                workers: 2,
             },
             features: FeatureFlags {
                 server: true,
@@ -368,7 +371,8 @@ mod tests {
         assert!(c.engine_database_url.is_none());
         assert!(c.gcs_bucket.is_none());
         assert!(c.gcp_project_id.is_none());
-        assert_eq!(c.job.workers, 1);
+        assert_eq!(c.job.workers, 2);
+        assert_eq!(c.job.poll_interval_ms, 500);
         assert_eq!(c.stuck_game_max_age_hours, 2);
         assert!(c.features.server && c.features.jobs && c.features.cron);
     }
