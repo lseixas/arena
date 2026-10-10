@@ -383,6 +383,10 @@ struct BracketMatchView<'a> {
     tournament_match: &'a TournamentMatch,
     participants: &'a [BracketParticipant],
     games: &'a [MatchGame],
+    /// Registered snakes available for owner slot edits (round 1 only).
+    registrations: &'a [tournament::RegistrationWithDetails],
+    tournament_id: Uuid,
+    is_owner: bool,
 }
 
 /// One team row inside a match card: color chip, name, score cell.
@@ -432,6 +436,11 @@ fn bracket_match_card(
     // Byes only have their single seeded participant persisted.
     let is_bye = m.round == 1 && view.participants.len() == 1;
     let is_live = m.status == MatchStatus::InProgress;
+    let can_edit_slots = view.is_owner
+        && m.round == 1
+        && m.status == MatchStatus::Scheduled
+        && view.games.is_empty();
+    let open_game = view.games.last();
 
     let col = m.visual_column * 2 + 1;
     let row = m.visual_row + 1;
@@ -484,8 +493,12 @@ fn bracket_match_card(
                     span class="label" { "THEATER" }
                     span class="go" { "watch live →" }
                 }
+            } @else if let Some(game) = open_game {
+                a class="game-open-btn" href={"/games/"(game.game_id)} {
+                    "Open game →"
+                }
             }
-            @if !view.games.is_empty() {
+            @if view.games.len() > 1 {
                 div class="mgames" {
                     @for (i, game) in view.games.iter().enumerate() {
                         a href={"/games/"(game.game_id)} {
@@ -493,6 +506,31 @@ fn bracket_match_card(
                             @if is_tie_game(game.winner_id, i + 1 < view.games.len(), m.status) {
                                 " (tie)"
                             }
+                        }
+                    }
+                }
+            }
+            @if can_edit_slots {
+                div class="bracket-edit" {
+                    @for p in view.participants {
+                        form class="bracket-slot-form"
+                            action={"/tournaments/"(view.tournament_id)"/bracket-slot"}
+                            method="post" {
+                            input type="hidden" name="match_id" value=(m.match_id);
+                            input type="hidden" name="slot" value=(p.slot);
+                            label class="vh" for={"slot-"(p.match_participant_id)} {
+                                "Slot " (p.slot)
+                            }
+                            select id={"slot-"(p.match_participant_id)}
+                                name="battlesnake_id" aria-label={"Slot "(p.slot)" snake"} {
+                                @for reg in view.registrations {
+                                    option value=(reg.battlesnake_id)
+                                        selected[p.battlesnake_id == Some(reg.battlesnake_id)] {
+                                        (reg.snake_name) " (by " (reg.owner_login) ")"
+                                    }
+                                }
+                            }
+                            button type="submit" class="btn sm" { "Set" }
                         }
                     }
                 }
@@ -510,6 +548,8 @@ fn bracket_section(
     matches: &[TournamentMatch],
     participants_by_match: &HashMap<Uuid, Vec<BracketParticipant>>,
     games_by_match: &HashMap<Uuid, Vec<MatchGame>>,
+    registrations: &[tournament::RegistrationWithDetails],
+    is_owner: bool,
 ) -> Markup {
     let total_rounds = matches.iter().map(|m| m.round).max().unwrap_or(0);
     // No matches means no grid: `repeat(0, ...)` is invalid CSS.
@@ -597,6 +637,9 @@ fn bracket_section(
                                 .get(&m.match_id)
                                 .unwrap_or(&EMPTY_PARTICIPANTS),
                             games: games_by_match.get(&m.match_id).unwrap_or(&EMPTY_GAMES),
+                            registrations,
+                            tournament_id: t.tournament_id,
+                            is_owner,
                         };
                         (bracket_match_card(&view, t.match_style, total_rounds))
 
@@ -775,6 +818,13 @@ impl TournamentSettingsForm {
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterForm {
+    pub battlesnake_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BracketSlotForm {
+    pub match_id: Uuid,
+    pub slot: i16,
     pub battlesnake_id: Uuid,
 }
 
@@ -1239,7 +1289,14 @@ pub async fn show_tournament(
 
             // Bracket (in_progress / completed only)
             @if let Some((matches, participants_by_match, games_by_match)) = &bracket_data {
-                (bracket_section(&t, matches, participants_by_match, games_by_match))
+                (bracket_section(
+                    &t,
+                    matches,
+                    participants_by_match,
+                    games_by_match,
+                    &registrations,
+                    is_owner,
+                ))
             }
 
             div class="grid" {
@@ -1859,6 +1916,227 @@ pub async fn move_seed(
         &state,
         session.session_id,
         "Seed updated".to_string(),
+        session::FLASH_TYPE_SUCCESS,
+        &detail_url,
+    )
+    .await
+}
+
+/// POST /tournaments/{id}/bracket-slot — owner edits who occupies a round-1
+/// scheduled slot. If the chosen snake is already in another editable slot,
+/// the two snakes are swapped.
+pub async fn set_bracket_slot(
+    State(state): State<AppState>,
+    CurrentUserWithSession { user, session }: CurrentUserWithSession,
+    Path(tournament_id): Path<Uuid>,
+    Form(form): Form<BracketSlotForm>,
+) -> ServerResult<impl IntoResponse, StatusCode> {
+    let detail_url = format!("/tournaments/{tournament_id}");
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .wrap_err("Failed to begin bracket-slot transaction")?;
+
+    let t = tournament::get_tournament_for_update(&mut tx, tournament_id)
+        .await
+        .wrap_err("Failed to fetch tournament")?
+        .ok_or_else(|| "Tournament not found".to_string())
+        .with_status(StatusCode::NOT_FOUND)?;
+
+    if t.user_id != user.user_id {
+        if is_hidden_from(&mut *tx, &t, user.user_id).await? {
+            return Err("Tournament not found".to_string()).with_status(StatusCode::NOT_FOUND);
+        }
+        return Err("Only the tournament owner can edit the bracket".to_string())
+            .with_status(StatusCode::FORBIDDEN);
+    }
+
+    if t.status != TournamentStatus::InProgress {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Bracket slots can only be edited while the tournament is in progress".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    }
+
+    if form.slot != 1 && form.slot != 2 {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Invalid bracket slot".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    }
+
+    let Some(m) = tournament::get_match_by_id(&mut *tx, form.match_id)
+        .await
+        .wrap_err("Failed to fetch match")?
+        .filter(|m| m.tournament_id == tournament_id)
+    else {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Match not found".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    };
+
+    if m.round != 1 || m.status != MatchStatus::Scheduled {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Only scheduled round-1 slots can be edited".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    }
+
+    if tournament::count_match_games(&mut *tx, m.match_id)
+        .await
+        .wrap_err("Failed to check match games")?
+        > 0
+    {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Cannot edit a slot after its games have started".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    }
+
+    if !tournament::is_battlesnake_registered(&mut *tx, tournament_id, form.battlesnake_id)
+        .await
+        .wrap_err("Failed to check registration")?
+    {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "That snake is not registered in this tournament".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    }
+
+    let participants = tournament::get_participants_for_match(&mut *tx, m.match_id)
+        .await
+        .wrap_err("Failed to fetch match participants")?;
+
+    let Some(target) = participants.iter().find(|p| p.slot == form.slot) else {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Bracket slot not found".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    };
+
+    if target.battlesnake_id == Some(form.battlesnake_id) {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Slot already has that snake".to_string(),
+            session::FLASH_TYPE_INFO,
+            &detail_url,
+        )
+        .await;
+    }
+
+    let previous = target.battlesnake_id;
+    let other = tournament::find_participant_holding_snake(
+        &mut *tx,
+        tournament_id,
+        form.battlesnake_id,
+    )
+    .await
+    .wrap_err("Failed to locate snake in bracket")?;
+
+    if let Some(other) = other {
+        let Some(other_match) = tournament::get_match_by_id(&mut *tx, other.match_id)
+            .await
+            .wrap_err("Failed to fetch other match")?
+        else {
+            return flash_redirect(
+                &state,
+                session.session_id,
+                "Could not resolve the snake's current match".to_string(),
+                session::FLASH_TYPE_ERROR,
+                &detail_url,
+            )
+            .await;
+        };
+
+        if other_match.round != 1
+            || other_match.status != MatchStatus::Scheduled
+            || tournament::count_match_games(&mut *tx, other_match.match_id)
+                .await
+                .wrap_err("Failed to check other match games")?
+                > 0
+        {
+            return flash_redirect(
+                &state,
+                session.session_id,
+                "That snake is already locked into another match".to_string(),
+                session::FLASH_TYPE_ERROR,
+                &detail_url,
+            )
+            .await;
+        }
+
+        // Clear first to avoid unique (match_id, battlesnake_id) collisions mid-swap.
+        tournament::set_match_participant_battlesnake(
+            &mut *tx,
+            other.match_participant_id,
+            None,
+        )
+        .await
+        .wrap_err("Failed to clear other slot")?;
+        tournament::set_match_participant_battlesnake(
+            &mut *tx,
+            target.match_participant_id,
+            Some(form.battlesnake_id),
+        )
+        .await
+        .wrap_err("Failed to set target slot")?;
+        tournament::set_match_participant_battlesnake(
+            &mut *tx,
+            other.match_participant_id,
+            previous,
+        )
+        .await
+        .wrap_err("Failed to finish snake swap")?;
+    } else {
+        tournament::set_match_participant_battlesnake(
+            &mut *tx,
+            target.match_participant_id,
+            Some(form.battlesnake_id),
+        )
+        .await
+        .wrap_err("Failed to set bracket slot")?;
+    }
+
+    tx.commit()
+        .await
+        .wrap_err("Failed to commit bracket-slot transaction")?;
+
+    flash_redirect(
+        &state,
+        session.session_id,
+        "Bracket slot updated".to_string(),
         session::FLASH_TYPE_SUCCESS,
         &detail_url,
     )

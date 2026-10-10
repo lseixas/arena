@@ -1268,10 +1268,13 @@ where
     Ok(participant)
 }
 
-pub async fn get_participants_for_match(
-    pool: &PgPool,
+pub async fn get_participants_for_match<'e, E>(
+    executor: E,
     match_id: Uuid,
-) -> cja::Result<Vec<MatchParticipant>> {
+) -> cja::Result<Vec<MatchParticipant>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let participants = sqlx::query_as!(
         MatchParticipant,
         r#"
@@ -1290,7 +1293,7 @@ pub async fn get_participants_for_match(
         "#,
         match_id
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .wrap_err("Failed to fetch match participants")?;
 
@@ -1592,6 +1595,9 @@ pub async fn find_stale_in_progress_matches(
 #[derive(Debug, Clone)]
 pub struct BracketParticipant {
     pub match_id: Uuid,
+    pub match_participant_id: Uuid,
+    /// Which side of the match this participant occupies (1 or 2).
+    pub slot: i16,
     pub battlesnake_id: Option<Uuid>,
     pub snake_name: Option<String>,
     pub snake_color: Option<String>,
@@ -1609,6 +1615,8 @@ pub async fn get_participants_with_names_for_tournament(
         r#"
         SELECT
             mp.match_id,
+            mp.match_participant_id,
+            mp.slot,
             mp.battlesnake_id,
             b.name as "snake_name?",
             b.color as "snake_color?"
@@ -1625,6 +1633,94 @@ pub async fn get_participants_with_names_for_tournament(
     .wrap_err("Failed to fetch bracket participants")?;
 
     Ok(participants)
+}
+
+/// Set (or clear) the battlesnake occupying a match participant slot.
+pub async fn set_match_participant_battlesnake<'e, E>(
+    executor: E,
+    match_participant_id: Uuid,
+    battlesnake_id: Option<Uuid>,
+) -> cja::Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result = sqlx::query!(
+        r#"
+        UPDATE match_participants
+        SET battlesnake_id = $2
+        WHERE match_participant_id = $1
+        "#,
+        match_participant_id,
+        battlesnake_id,
+    )
+    .execute(executor)
+    .await
+    .wrap_err("Failed to update match participant battlesnake")?;
+
+    if result.rows_affected() != 1 {
+        return Err(color_eyre::eyre::eyre!(
+            "Match participant {match_participant_id} not found"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Find a participant row holding `battlesnake_id` anywhere in this tournament.
+pub async fn find_participant_holding_snake<'e, E>(
+    executor: E,
+    tournament_id: Uuid,
+    battlesnake_id: Uuid,
+) -> cja::Result<Option<MatchParticipant>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let participant = sqlx::query_as!(
+        MatchParticipant,
+        r#"
+        SELECT
+            mp.match_participant_id,
+            mp.match_id,
+            mp.slot,
+            mp.battlesnake_id,
+            mp.source_match_id,
+            mp.participant_type as "participant_type: ParticipantType",
+            mp.seed_position,
+            mp.created_at
+        FROM match_participants mp
+        JOIN tournament_matches tm ON mp.match_id = tm.match_id
+        WHERE tm.tournament_id = $1
+          AND mp.battlesnake_id = $2
+        LIMIT 1
+        "#,
+        tournament_id,
+        battlesnake_id,
+    )
+    .fetch_optional(executor)
+    .await
+    .wrap_err("Failed to look up snake in bracket")?;
+
+    Ok(participant)
+}
+
+/// Count match games for a match (used to refuse slot edits after play starts).
+pub async fn count_match_games<'e, E>(executor: E, match_id: Uuid) -> cja::Result<i64>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) AS "count!"
+        FROM match_games
+        WHERE match_id = $1
+        "#,
+        match_id
+    )
+    .fetch_one(executor)
+    .await
+    .wrap_err("Failed to count match games")?;
+
+    Ok(count)
 }
 
 /// All match games for every match in a tournament, in one query.

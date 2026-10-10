@@ -267,6 +267,10 @@ pub fn routes(app_state: AppState) -> axum::Router {
             "/tournaments/{id}/import-leaderboard",
             axum::routing::post(tournament::import_leaderboard),
         )
+        .route(
+            "/tournaments/{id}/bracket-slot",
+            axum::routing::post(tournament::set_bracket_slot),
+        )
         // Admin routes
         .route("/admin", get(admin::dashboard))
         // Game API routes for board viewer (with CORS)
