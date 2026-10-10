@@ -288,7 +288,7 @@ async fn register_snake_in_tx(
             .wrap_err("Failed to count user registrations")?;
     if user_reg_count >= i64::from(t.max_snakes_per_user) {
         return Ok(Err(format!(
-            "You have reached the limit of {} snake(s) for this tournament",
+            "Limit of {} snake(s) per player reached for this tournament",
             t.max_snakes_per_user
         )));
     }
@@ -1016,25 +1016,35 @@ pub async fn show_tournament(
 
     let is_owner = viewer_id == Some(t.user_id);
 
-    // Snakes the viewer could register: their own, not yet in this tournament,
-    // and only while they are under the per-user cap.
+    // Snakes the viewer could register from the picker:
+    // - owner: own + public snakes not yet registered (can also paste a UUID)
+    // - others: only their own, and only while under the per-user cap
     let registerable_snakes = if let Some(u) = viewer.as_ref() {
         if can_register(&t, is_owner) {
-            let user_reg_count = registrations
-                .iter()
-                .filter(|r| r.user_id == u.user_id)
-                .count() as i32;
-            if user_reg_count < t.max_snakes_per_user {
-                let registered_ids: Vec<Uuid> =
-                    registrations.iter().map(|r| r.battlesnake_id).collect();
-                battlesnake::get_battlesnakes_by_user_id(&state.db, u.user_id)
+            let registered_ids: Vec<Uuid> =
+                registrations.iter().map(|r| r.battlesnake_id).collect();
+            if is_owner {
+                battlesnake::get_available_battlesnakes(&state.db, u.user_id)
                     .await
-                    .wrap_err("Failed to fetch viewer's battlesnakes")?
+                    .wrap_err("Failed to fetch available battlesnakes")?
                     .into_iter()
                     .filter(|s| !registered_ids.contains(&s.battlesnake_id))
                     .collect()
             } else {
-                vec![]
+                let user_reg_count = registrations
+                    .iter()
+                    .filter(|r| r.user_id == u.user_id)
+                    .count() as i32;
+                if user_reg_count < t.max_snakes_per_user {
+                    battlesnake::get_battlesnakes_by_user_id(&state.db, u.user_id)
+                        .await
+                        .wrap_err("Failed to fetch viewer's battlesnakes")?
+                        .into_iter()
+                        .filter(|s| !registered_ids.contains(&s.battlesnake_id))
+                        .collect()
+                } else {
+                    vec![]
+                }
             }
         } else {
             vec![]
@@ -1042,6 +1052,25 @@ pub async fn show_tournament(
     } else {
         vec![]
     };
+
+    // Owner picker labels: "Snake Name (by github_login)"
+    let mut registerable_owner_logins: HashMap<Uuid, String> = HashMap::new();
+    if is_owner {
+        for snake in &registerable_snakes {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                registerable_owner_logins.entry(snake.user_id)
+            {
+                let login = user::get_user_by_id(&state.db, snake.user_id)
+                    .await
+                    .wrap_err("Failed to fetch battlesnake owner")?
+                    .map(|o| o.github_login)
+                    .unwrap_or_else(|| "Unknown".to_string());
+                entry.insert(login);
+            }
+        }
+    }
+
+    let owner_can_register = is_owner && can_register(&t, true);
 
     // Leaderboards for the owner's import form
     let leaderboards = if is_owner && registrations_editable(t.status) {
@@ -1331,7 +1360,35 @@ pub async fn show_tournament(
                         }
                     }
 
-                    @if !registerable_snakes.is_empty() {
+                    @if owner_can_register {
+                        div class="block" {
+                            h3 { "Add Snakes" }
+                            p class="railp" {
+                                "As owner you can register any public snake, or a private one by ID. Registered snakes appear in the list with Unregister."
+                            }
+                            @if !registerable_snakes.is_empty() {
+                                form class="rail-form" action={"/tournaments/"(t.tournament_id)"/register"} method="post" {
+                                    select name="battlesnake_id" aria-label="Battlesnake" {
+                                        @for snake in &registerable_snakes {
+                                            option value=(snake.battlesnake_id) {
+                                                (snake.name)
+                                                @if let Some(login) = registerable_owner_logins.get(&snake.user_id) {
+                                                    " (by " (login) ")"
+                                                }
+                                            }
+                                        }
+                                    }
+                                    button type="submit" class="btn sm solid" { "Register" }
+                                }
+                            }
+                            form class="rail-form" action={"/tournaments/"(t.tournament_id)"/register"} method="post" {
+                                label class="lbl" for="owner_battlesnake_id" { "Battlesnake ID" }
+                                input type="text" id="owner_battlesnake_id" name="battlesnake_id"
+                                    placeholder="uuid" required {}
+                                button type="submit" class="btn sm solid" { "Register by ID" }
+                            }
+                        }
+                    } @else if !registerable_snakes.is_empty() {
                         div class="block" {
                             h3 { "Register a Snake" }
                             form class="rail-form" action={"/tournaments/"(t.tournament_id)"/register"} method="post" {
@@ -1526,7 +1583,11 @@ pub async fn update_settings(
     .await
 }
 
-/// POST /tournaments/{id}/register — register one of the caller's snakes.
+/// POST /tournaments/{id}/register — register a snake.
+///
+/// Non-owners may only register their own snakes. Tournament owners may
+/// register any existing snake (public picker or by UUID); the registration
+/// is attributed to the snake's real owner so per-user caps stay correct.
 pub async fn register_snake(
     State(state): State<AppState>,
     CurrentUserWithSession { user, session }: CurrentUserWithSession,
@@ -1572,7 +1633,18 @@ pub async fn register_snake(
         .await
         .wrap_err("Failed to fetch battlesnake")?;
 
-    let Some(snake) = snake.filter(|s| s.user_id == user.user_id) else {
+    let Some(snake) = snake else {
+        return flash_redirect(
+            &state,
+            session.session_id,
+            "Battlesnake not found".to_string(),
+            session::FLASH_TYPE_ERROR,
+            &detail_url,
+        )
+        .await;
+    };
+
+    if !is_owner && snake.user_id != user.user_id {
         return flash_redirect(
             &state,
             session.session_id,
@@ -1581,25 +1653,31 @@ pub async fn register_snake(
             &detail_url,
         )
         .await;
-    };
+    }
 
-    let registration =
-        match register_snake_in_tx(&mut tx, &t, user.user_id, snake.battlesnake_id, &snake.name)
-            .await?
-        {
-            Ok(registration) => registration,
-            Err(message) => {
-                // Dropping the transaction rolls it back.
-                return flash_redirect(
-                    &state,
-                    session.session_id,
-                    message,
-                    session::FLASH_TYPE_ERROR,
-                    &detail_url,
-                )
-                .await;
-            }
-        };
+    // Attribute the seat to the snake's owner (same as leaderboard import).
+    let registration = match register_snake_in_tx(
+        &mut tx,
+        &t,
+        snake.user_id,
+        snake.battlesnake_id,
+        &snake.name,
+    )
+    .await?
+    {
+        Ok(registration) => registration,
+        Err(message) => {
+            // Dropping the transaction rolls it back.
+            return flash_redirect(
+                &state,
+                session.session_id,
+                message,
+                session::FLASH_TYPE_ERROR,
+                &detail_url,
+            )
+            .await;
+        }
+    };
 
     tx.commit()
         .await
